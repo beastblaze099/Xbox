@@ -1,0 +1,103 @@
+name: Secure RDP via Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Minutes to keep alive. Max 360'
+        required: false
+        default: '360'
+      install_choco:
+        description: 'Install common tools: git, vscode, chrome'
+        type: boolean
+        default: true
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360 # GitHub hard limit
+
+    steps:
+      - name: Configure RDP + Firewall
+        shell: powershell
+        run: |
+          Write-Host "Enabling RDP..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          # Keep NLA ON for security. Set to 0 only if your client is old
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+
+          Write-Host "Configuring Firewall..."
+          New-NetFirewallRule -DisplayName "Tailscale RDP" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Force -ErrorAction SilentlyContinue
+          Restart-Service -Name TermService -Force
+
+      - name: Create Ephemeral RDP User
+        shell: powershell
+        run: |
+          # Generate 16 char secure password
+          $password = -join ((65..90) + (97..122) + (48..57) + (33..47) | Get-Random -Count 16 | % {[char]$_})
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue) { Remove-LocalUser -Name "RDPUser" }
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+
+          # Mask password in logs so it doesn't leak
+          echo "::add-mask::$password"
+          echo "RDP_USER=RDPUser" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          Write-Host "User RDPUser created successfully"
+
+      - name: Setup Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          version: latest
+          args: --hostname=gh-runner-${{ github.run_id }} --ssh
+
+      - name: Get Tailscale IP
+        id: tailscale
+        shell: powershell
+        run: |
+          $tsIP = ""
+          for ($i=0; $i -lt 12; $i++) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5
+          }
+          if (-not $tsIP) { throw "Tailscale IP not assigned" }
+          echo "ip=$tsIP" >> $env:GITHUB_OUTPUT
+          echo "Tailscale IP: $tsIP"
+
+      - name: Install Tools [Optional]
+        if: ${{ inputs.install_choco }}
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          choco install git vscode googlechrome 7zip -y --no-progress
+
+      - name: Verify RDP Port
+        shell: powershell
+        run: |
+          $test = Test-NetConnection -ComputerName ${{ steps.tailscale.outputs.ip }} -Port 3389
+          if (-not $test.TcpTestSucceeded) { throw "RDP Port 3389 not reachable" }
+          Write-Host "RDP is reachable on ${{ steps.tailscale.outputs.ip }}:3389"
+
+      - name: Keep Alive
+        shell: powershell
+        run: |
+          $duration = [int]${{ inputs.duration }}
+          Write-Host "`n========== RDP ACCESS INFO =========="
+          Write-Host "Address: ${{ steps.tailscale.outputs.ip }}"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "Duration: $duration minutes"
+          Write-Host "=====================================`n"
+          Write-Host "Connect now. Runner will auto-shutdown."
+
+          for ($i = $duration; $i -gt 0; $i--) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Time left: $i min"
+              Start-Sleep -Seconds 60
+          }
